@@ -62,6 +62,8 @@ h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;
 .scrub{display:flex;align-items:center;gap:8px}
 .scrub input[type=range]{flex:1;min-width:0;accent-color:var(--accent)}
 .meta{color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:4px 16px}
+.metarow{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px}
+.btn.small{font-size:12px;padding:5px 10px}
 .side{display:flex;flex-direction:column;gap:12px;min-width:0}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:10px;min-width:0}
 #roi-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
@@ -114,14 +116,14 @@ td:first-child{font-family:var(--f-ui)}
   <header class="top">
     <div>
       <h1>Ultrasound TIC Analyzer</h1>
-      <p>Load a cine loop, draw your ROIs on the frame, extract time–intensity curves, export to Excel.</p>
+      <p>Load a cine loop (MP4, AVI, MOV, WebM), draw your ROIs on the frame, extract time–intensity curves, export to Excel.</p>
     </div>
     <div class="top-actions">
       <label class="btn primary" for="file-in">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 11V2M4.5 5.5 8 2l3.5 3.5M2.5 11v2.5h11V11"/></svg>
         Load video
       </label>
-      <input type="file" id="file-in" accept="video/*,.mp4,.webm,.mov,.m4v,.ogv" hidden>
+      <input type="file" id="file-in" accept="video/*,.avi,.mp4,.webm,.mov,.m4v,.ogv,.mkv,.wmv" hidden>
       <button class="btn" id="demo-btn" type="button">Load demo phantom</button>
     </div>
   </header>
@@ -149,7 +151,7 @@ td:first-child{font-family:var(--f-ui)}
         <button class="btn icon" id="next" type="button" title="Next sample" aria-label="Next sample"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="m5 2 7 6-7 6z"/></svg></button>
         <span class="mono" id="time-read">0.00 s</span>
       </div>
-      <div class="meta mono" id="meta"></div>
+      <div class="metarow"><div class="meta mono" id="meta"></div><button class="btn small" id="save-mp4" type="button" hidden>Save converted MP4</button></div>
     </div>
 
     <aside class="side">
@@ -290,14 +292,15 @@ function seek(v,t){
   });
 }
 let videoEl=null;
-async function makeVideo(file){
+async function makeVideo(file,displayName){
   if(videoEl){URL.revokeObjectURL(videoEl.src);videoEl.remove()}
   const v=document.createElement('video');
   v.muted=true;v.playsInline=true;v.preload='auto';
   v.style.cssText='position:fixed;left:0;top:0;width:2px;height:2px;opacity:0;pointer-events:none';
   document.body.appendChild(v); videoEl=v;
   v.src=URL.createObjectURL(file);
-  await new Promise((res,rej)=>{v.addEventListener('loadeddata',res,{once:true});v.addEventListener('error',()=>rej(new Error('decode')),{once:true})});
+  await new Promise((res,rej)=>{const to=setTimeout(()=>rej(new Error('decode')),10000);v.addEventListener('loadeddata',()=>{clearTimeout(to);res()},{once:true});v.addEventListener('error',()=>{clearTimeout(to);rej(new Error('decode'))},{once:true})});
+  file={name:displayName||file.name};
   if(!isFinite(v.duration)){
     const p=new Promise(r=>{const h=()=>{if(isFinite(v.duration)){v.removeEventListener('durationchange',h);r()}};v.addEventListener('durationchange',h)});
     v.currentTime=1e7; await Promise.race([p,new Promise(r=>setTimeout(r,4000))]);
@@ -312,7 +315,7 @@ async function setSource(s,keepRois){
   const sameSize = src && src.W===s.W && src.H===s.H;
   src=s;
   for(const c of [view,base,work,maskC]){c.width=s.W;c.height=s.H}
-  if(!keepRois && !sameSize){rois=[];selId=null}
+  if(!keepRois || !sameSize){rois=[];selId=null}
   else rois.forEach(computeMask);
   results=null; roiVersion++;
   $('scrub').max=s.duration||0; $('scrub').value=0;
@@ -502,7 +505,7 @@ async function run(){
   refreshResults(); await src.drawTo(bctx,curT); render();
 }
 $('run').onclick=run;
-$('cancel').onclick=()=>{cancelReq=true};
+$('cancel').onclick=()=>{if(loading){loadCancelled=true;if(ffInstance){try{ffInstance.terminate()}catch(e){}ffInstance=null}}else cancelReq=true};
 
 // ---------- metrics ----------
 function metrics(s){
@@ -615,12 +618,81 @@ $('copy').onclick=()=>{
   try{navigator.clipboard.writeText(txt).then(()=>{st.textContent='Raw TIC copied as tab-separated text. Paste into Excel.'},fallback)}catch(e){fallback()}
 };
 
-// ---------- loading ----------
-async function loadFile(file){
-  if(!file||running)return;const st=$('run-status');st.className='status';st.textContent=`Loading ${file.name}…`;
-  try{const s=await makeVideo(file);if(!s.W||!s.duration)throw new Error('decode');await setSource(s,true);st.textContent=`Loaded ${file.name}. Draw ROIs, then run the analysis.`}
-  catch(e){st.textContent=`This browser can't decode ${file.name}. Export the clip from the scanner or workstation as MP4 (H.264) or WebM. DICOM cine loops need converting to MP4 first.`;st.className='status err'}
+// ---------- in-browser conversion (AVI, DV, and other formats browsers can't play) ----------
+const FF_BASE=window.FF_BASE||'https://cdn.jsdelivr.net/npm/';
+const FF_URLS={ffmpeg:FF_BASE+'@ffmpeg/ffmpeg@0.12.15/dist/umd/ffmpeg.js',worker:FF_BASE+'@ffmpeg/ffmpeg@0.12.15/dist/umd/814.ffmpeg.js',core:FF_BASE+'@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js',wasm:FF_BASE+'@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.wasm'};
+let ffAssets=null, ffInstance=null, convertedBlob=null;
+async function blobURL(url,type){const r=await fetch(url);if(!r.ok)throw new Error('fetch '+url);return URL.createObjectURL(new Blob([await r.arrayBuffer()],{type}))}
+async function loadFFAssets(){
+  if(ffAssets) return ffAssets;
+  const [ffSrc,workerURL,coreURL,wasmURL]=await Promise.all([
+    fetch(FF_URLS.ffmpeg).then(r=>{if(!r.ok)throw new Error('fetch');return r.text()}),
+    blobURL(FF_URLS.worker,'text/javascript'),blobURL(FF_URLS.core,'text/javascript'),blobURL(FF_URLS.wasm,'application/wasm')]);
+  // The UMD build spawns its worker from the CDN path, which browsers block cross-origin. Point it at a same-origin blob instead.
+  const hook='new URL(e.p+e.u(814),e.b)';
+  if(!ffSrc.includes(hook)) throw new Error('converter build changed');
+  const patched=ffSrc.replace(hook,JSON.stringify(workerURL));
+  await new Promise((res,rej)=>{const s=document.createElement('script');s.src=URL.createObjectURL(new Blob([patched],{type:'text/javascript'}));s.onload=res;s.onerror=()=>rej(new Error('script'));document.head.appendChild(s)});
+  ffAssets={coreURL,wasmURL};return ffAssets;
 }
+const hms=s=>{const m=/(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(s);return m?(+m[1])*3600+(+m[2])*60+(+m[3]):null};
+async function convertToMp4(file,onProgress){
+  onProgress(0,'Downloading the video converter (about 32 MB, first use only)…');
+  const {coreURL,wasmURL}=await loadFFAssets();
+  const ff=new FFmpegWASM.FFmpeg(); ffInstance=ff;
+  let dur=null;
+  ff.on('log',({message})=>{
+    if(dur==null&&/Duration:/.test(message))dur=hms(message.split('Duration:')[1]);
+    const tm=/time=\s*(-?[\d:.]+)/.exec(message);if(tm&&dur){const t=hms(tm[1]);if(t!=null)onProgress(Math.min(1,t/dur),`Converting ${file.name}… ${(Math.min(1,t/dur)*100).toFixed(0)}%`)}
+  });
+  await ff.load({coreURL,wasmURL});
+  onProgress(0,`Converting ${file.name}…`);
+  let input, mounted=false;
+  const safe=file.name.replace(/[^\w.\-]/g,'_');
+  try{await ff.createDir('/in');await ff.mount('WORKERFS',{files:[file]},'/in');input='/in/'+file.name;mounted=true}
+  catch(e){await ff.writeFile(safe,new Uint8Array(await file.arrayBuffer()));input=safe}
+  // Near-transparent H.264 (CRF 12) with a keyframe every 15 frames so per-frame seeking stays fast.
+  const code=await ff.exec(['-i',input,'-map','0:v:0','-an','-vf','scale=trunc(iw/2)*2:trunc(ih/2)*2','-c:v','libx264','-preset','ultrafast','-crf','12','-g','15','-pix_fmt','yuv420p','-movflags','+faststart','out.mp4']);
+  if(code!==0) throw new Error('convert');
+  const data=await ff.readFile('out.mp4');
+  try{if(mounted)await ff.unmount('/in');else await ff.deleteFile(safe)}catch(e){}
+  ff.terminate(); ffInstance=null;
+  return new Blob([data.buffer],{type:'video/mp4'});
+}
+
+// ---------- loading ----------
+let loading=false, loadCancelled=false;
+function setLoading(on){loading=on;$('run').disabled=on;$('cancel').hidden=!on;$('file-in').disabled=on;$('demo-btn').disabled=on}
+async function loadFile(file){
+  if(!file||running||loading)return;const st=$('run-status');st.className='status';st.textContent=`Loading ${file.name}…`;
+  $('save-mp4').hidden=true; convertedBlob=null;
+  loadCancelled=false; setLoading(true); $('prog-bar').style.width='0%';
+  try{
+    let s=null;
+    if(!/\.avi$/i.test(file.name)){try{s=await makeVideo(file);if(!s.W||!s.duration)s=null}catch(e){s=null}}
+    if(!s){
+      const blob=await convertToMp4(file,(p,msg)=>{$('prog-bar').style.width=`${(p*100).toFixed(1)}%`;st.textContent=msg});
+      convertedBlob=blob;
+      s=await makeVideo(blob,file.name);
+      s.converted=true;
+      if(!s.W||!s.duration)throw new Error('decode');
+    }
+    await setSource(s,true);
+    st.textContent=s.converted?`Converted and loaded ${file.name}. Draw ROIs, then run the analysis.`:`Loaded ${file.name}. Draw ROIs, then run the analysis.`;
+    $('save-mp4').hidden=!s.converted;
+  }catch(e){
+    if(ffInstance){try{ffInstance.terminate()}catch(_){}ffInstance=null}
+    if(loadCancelled)e=new Error('cancelled');
+    st.textContent=e&&e.message==='cancelled'?'Loading cancelled.':`Couldn't load ${file.name}. ${e&&(e.message==='fetch'||/fetch|script/.test(e.message))?'The video converter needs an internet connection the first time. Check your connection and try again.':'The file may be damaged or use an unsupported format. Try exporting the clip from the scanner as MP4 or AVI.'}`;
+    if(!(e&&e.message==='cancelled'))st.className='status err';
+  }
+  setLoading(false); $('prog-bar').style.width='0%';
+}
+$('save-mp4').onclick=async()=>{
+  if(!convertedBlob||!src)return;const st=$('run-status');const filename=`${src.name}.mp4`;
+  if(dl){try{await dl.save({filename,data:convertedBlob});st.textContent=`Saved ${filename}.`}catch(e){st.textContent=e&&e.code==='declined'?'Save cancelled.':'Saving files is not available in this view.'}return}
+  const a=document.createElement('a');a.href=URL.createObjectURL(convertedBlob);a.download=filename;document.body.appendChild(a);a.click();a.remove();st.textContent=`Download started: ${filename}. Load it next time to skip conversion.`;
+};
 $('file-in').addEventListener('change',e=>{loadFile(e.target.files[0]);e.target.value=''});
 const stage=$('stage');
 ['dragenter','dragover'].forEach(ev=>stage.addEventListener(ev,e=>{e.preventDefault();$('drop').hidden=false}));
